@@ -1,0 +1,16 @@
+# Milestone 1 dependencies.  # 里程碑 1 依賴
+djitellopy==2.5.0
+opencv-python>=4.8
+av>=11.0
+numpy>=1.24
+pillow>=10.0
+
+# Milestone 2: YOLO object detection. Installing this also pulls in torch and
+# torchvision (~1 GB on disk), which is why it was held back until needed.
+# 里程碑 2：YOLO 物件偵測。安裝時會一併帶入 torch 與 torchvision（磁碟約 1 GB），所以先前刻意延後。
+ultralytics>=8.3
+
+# Stage 2 (EEG / ErrP). Only install once the real amplifier and its
+# streaming method are known. LSL is the assumed transport, not confirmed.
+# 第二階段（EEG / ErrP）。等真正的放大器與串流方式確定後再裝。LSL 只是假設的傳輸，尚未確認。
+# pylsl>=1.16

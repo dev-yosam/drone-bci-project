@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+
+# Run logs and flight recordings are per-session artefacts.
+# 執行日誌與飛行紀錄是單次實驗產物。
+logs/*.log
+logs/*.csv
+logs/*.png
+
+# YOLO weights. Kept out of version control for size, but they must exist in
+# models/ before going offline on the Tello router - see the README.
+# YOLO 權重因體積不進版本控制，但連上沒有對外網路的 Tello 路由器之前，models/ 裡必須已有檔案——見 README。
+*.pt
