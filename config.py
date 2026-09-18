@@ -69,7 +69,7 @@ VIDEO_RESOLUTION: str = "720p"  # "480p" or "720p"
 VIDEO_FPS: str = "30"  # "5", "15" or "30"
 VIDEO_BITRATE_MBPS: int = 0  # 0 = auto, otherwise 1-5  # 0 = 自動，否則 1-5
 
-WINDOW_NAME: str = "Tello BCI - Milestone 2"
+WINDOW_NAME: str = "Tello BCI - Milestone 3"
 # Tello streams 960x720. Scale the preview window without touching the frame
 # that later gets fed to YOLO.
 # Tello 串流解析度是 960x720。這裡只縮放預覽視窗，不會動到之後送進 YOLO 的影格。
@@ -140,8 +140,8 @@ RED_HSV_RANGES: tuple = (
 COLOUR_MIN_RATIO: float = 0.25  # fraction of the crop that must match  # 裁切區塊中必須符合顏色的像素比例
 
 # ---------------------------------------------------------------------------
-# Takeoff and room scanning (Milestone 3) - not used yet
-# 起飛與室內掃描（里程碑 3）— 尚未使用
+# Takeoff and room scanning (Milestone 3)
+# 起飛與室內掃描（里程碑 3）
 # ---------------------------------------------------------------------------
 
 TAKEOFF_HEIGHT_CM: int = 100
