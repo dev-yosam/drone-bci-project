@@ -17,16 +17,19 @@ reach the hardware. Centralising it here gives us three things:
    the drone in a safe state.
    關閉可以重複呼叫；主迴圈任何地方出錯，無人機仍會回到安全狀態。
 
-Milestone 1 scope: connect, stream video, read telemetry, shut down safely.
-No takeoff and no movement commands are implemented yet - ``land`` and
-``emergency`` exist only because a safe shutdown path needs them.
-里程碑 1 範圍：連線、串流影像、讀遙測、安全關閉。
-尚未實作起飛與移動——``land`` 與 ``emergency`` 存在，只因為安全關閉路徑需要它們。
+Milestone 3 adds takeoff, hover (zero RC) and yaw via ``send_rc_control``.
+Blocking SDK commands (takeoff, land) run on a background thread so the video
+loop stays alive. ``DRY_RUN`` still swallows every command that would move
+the airframe.
+里程碑 3 新增起飛、懸停（RC 全 0）與透過 ``send_rc_control`` 的偏航。
+會卡住的 SDK 指令（takeoff、land）放背景執行緒，影像迴圈才不會凍結。
+``DRY_RUN`` 仍然會吞掉所有會讓機身移動的指令。
 """
 
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -50,6 +53,14 @@ _FPS = {"5": Tello.FPS_5, "15": Tello.FPS_15, "30": Tello.FPS_30}
 # BackgroundFrameRead 在第一張真影格到來前會先填這個佔位圖；
 # 尺寸剛好是這個，就代表解碼器還沒產出畫面。
 _PLACEHOLDER_SHAPE = (300, 400, 3)
+
+
+def _clamp(value: int, limit: int) -> int:
+    """Clamp to +/- limit, then to the Tello RC range of -100..100.
+    先夾到 +/- limit，再夾到 Tello RC 的 -100..100。
+    """
+    limited = max(-limit, min(limit, int(value)))
+    return max(-100, min(100, limited))
 
 
 @dataclass
@@ -81,6 +92,12 @@ class TelloController:
 
         self._telemetry_cache: dict[str, tuple[float, object]] = {}
         self._is_shutdown: bool = False
+
+        self._lock = threading.Lock()
+        self._busy: bool = False
+        self._airborne: bool = False
+        self._last_rc: tuple[int, int, int, int] = (0, 0, 0, 0)
+        self._worker: Optional[threading.Thread] = None
 
     # -- connection ---------------------------------------------------------
     # -- 連線 ---------------------------------------------------------------
@@ -264,16 +281,85 @@ class TelloController:
         # 這項是走指令通道查詢，不是狀態串流，所以 TTL 設很長：一次飛行中它不會變。
         return self._cached("sdk", self.tello.query_sdk_version, ttl=3600.0)
 
-    # -- movement (only what a safe shutdown needs in Milestone 1) ----------
-    # -- 移動（里程碑 1 只實作安全關閉所需）--------------------------------
+    # -- movement -----------------------------------------------------------
+    # -- 移動 ---------------------------------------------------------------
 
-    def land(self) -> None:
-        if self.tello is None:
+    @property
+    def busy(self) -> bool:
+        """True while a blocking command (takeoff/land) is in flight.
+        正在執行會卡住的指令（起飛／降落）時為 True。
+        """
+        with self._lock:
+            return self._busy
+
+    @property
+    def airborne(self) -> bool:
+        """Whether we believe the drone is in the air.
+        我們認為無人機是否在空中。
+
+        Tracked locally rather than queried from the SDK: the height field is
+        noisy on takeoff and a missed state packet must not look like a landing.
+        用本地旗標追蹤，不向 SDK 查詢：起飛時高度欄位很吵，漏掉一包狀態不該被當成已降落。
+        """
+        with self._lock:
+            return self._airborne
+
+    @property
+    def last_rc(self) -> tuple[int, int, int, int]:
+        """Last (left-right, forward-back, up-down, yaw) sent, or intended in dry run.
+        上次送出的（左右、前後、上下、偏航）；dry run 時則是「本來會送」的值。
+        """
+        with self._lock:
+            return self._last_rc
+
+    def takeoff(self) -> bool:
+        """Start takeoff on a background thread. Returns False if refused.
+        在背景執行緒啟動起飛。被拒絕時回傳 False。
+        """
+        battery = self.battery
+        if battery is not None and battery < config.MIN_BATTERY_TAKEOFF:
+            LOGGER.error(
+                "Refusing takeoff: battery %s%% < %s%%",
+                battery,
+                config.MIN_BATTERY_TAKEOFF,
+            )
+            return False
+        return self._start_blocking("takeoff", self._takeoff_body, sets_airborne=True)
+
+    def land(self) -> bool:
+        """Start landing on a background thread. Returns False if already busy.
+        在背景執行緒啟動降落。若已在忙則回傳 False。
+        """
+        self.hover()
+        return self._start_blocking("land", self._land_body, sets_airborne=False)
+
+    def hover(self) -> None:
+        """Zero RC so the Tello holds position.
+        RC 全 0，讓 Tello 保持位置。
+        """
+        self.send_rc(0, 0, 0, 0)
+
+    def send_rc(self, left_right: int, forward_back: int, up_down: int, yaw: int) -> None:
+        """Send a velocity command. Clamped, ignored while takeoff/land is busy.
+        送出速度指令。會夾限；起飛／降落進行中會忽略。
+        """
+        lr = _clamp(left_right, config.MAX_FORWARD_SPEED)
+        fb = _clamp(forward_back, config.MAX_FORWARD_SPEED)
+        ud = _clamp(up_down, config.MAX_VERTICAL_SPEED)
+        yw = _clamp(yaw, config.MAX_YAW_SPEED)
+        with self._lock:
+            self._last_rc = (lr, fb, ud, yw)
+            busy = self._busy
+            airborne = self._airborne
+            tello = self.tello
+
+        if busy:
             return
         if self.dry_run:
-            LOGGER.info("[DRY_RUN] land() suppressed")
             return
-        self.tello.land()
+        if tello is None or not airborne:
+            return
+        tello.send_rc_control(lr, fb, ud, yw)
 
     def emergency(self) -> None:
         """Cut the motors immediately.
@@ -285,12 +371,71 @@ class TelloController:
         不等回覆就送出，因此另一條指令卡在逾時時，這條仍能出去。無人機會自由落體，
         所以這是最後手段，不是一般停止。
         """
-        if self.tello is None:
+        self.hover()
+        with self._lock:
+            self._airborne = False
+            tello = self.tello
+        if tello is None:
             return
         if self.dry_run:
             LOGGER.warning("[DRY_RUN] emergency() suppressed")
             return
-        self.tello.emergency()
+        tello.emergency()
+
+    def _start_blocking(self, name: str, body, sets_airborne: bool) -> bool:
+        with self._lock:
+            if self._busy:
+                LOGGER.warning("Ignoring %s: another blocking command is running", name)
+                return False
+            if sets_airborne and self._airborne:
+                LOGGER.info("Already airborne, ignoring takeoff")
+                return False
+            if not sets_airborne and not self._airborne:
+                LOGGER.info("Already on the ground, ignoring land")
+                return False
+            self._busy = True
+
+        def work() -> None:
+            ok = False
+            try:
+                ok = body()
+            except Exception:  # noqa: BLE001 - worker must not kill the process
+                LOGGER.exception("%s failed", name)
+                ok = False
+            finally:
+                with self._lock:
+                    if name == "takeoff":
+                        self._airborne = bool(ok)
+                    elif name == "land":
+                        self._airborne = False if ok else self._airborne
+                    self._busy = False
+
+        thread = threading.Thread(target=work, name=f"tello-{name}", daemon=True)
+        self._worker = thread
+        thread.start()
+        return True
+
+    def _takeoff_body(self) -> bool:
+        if self.tello is None:
+            return False
+        if self.dry_run:
+            LOGGER.info("[DRY_RUN] takeoff() suppressed")
+            time.sleep(0.4)
+            return True
+        self.tello.takeoff()
+        LOGGER.info("Takeoff complete, height %s cm", self.height_cm)
+        return True
+
+    def _land_body(self) -> bool:
+        if self.tello is None:
+            return False
+        if self.dry_run:
+            LOGGER.info("[DRY_RUN] land() suppressed")
+            time.sleep(0.4)
+            return True
+        self.tello.land()
+        LOGGER.info("Land complete")
+        return True
 
     # -- shutdown -----------------------------------------------------------
     # -- 關閉 ---------------------------------------------------------------

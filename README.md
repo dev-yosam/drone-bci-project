@@ -8,8 +8,8 @@ EEG ErrP detector is added later as a human-in-the-loop safety veto.
 之後會加入 32 通道 EEG ErrP 偵測器，作為人在迴路中的安全否決。
 
 The project is built milestone by milestone. **This repository currently
-implements Milestones 1 and 2.**
-專案依里程碑逐步建構。**目前這個儲存庫已實作里程碑 1 與 2。**
+implements Milestones 1, 2 and 3.**
+專案依里程碑逐步建構。**目前這個儲存庫已實作里程碑 1、2 與 3。**
 
 ## Current status
 ## 目前進度
@@ -18,17 +18,18 @@ implements Milestones 1 and 2.**
 | --- | --- | --- |
 | 1 | Connect, video stream, display, battery, safe shutdown / 連線、影像串流、顯示、電量、安全關閉 | Implemented 已完成 |
 | 2 | YOLO detection, colour filter, target selection / YOLO 偵測、顏色濾鏡、目標選擇 | Implemented 已完成 |
-| 3 | Takeoff, hover, yaw scan / 起飛、懸停、偏航掃描 | Not started 尚未開始 |
+| 3 | Takeoff, hover, yaw scan / 起飛、懸停、偏航掃描 | Implemented 已完成 |
 | 4 | Visual servo yaw alignment / 視覺伺服偏航對齊 | Not started 尚未開始 |
 | 5 | Forward approach, automatic stop / 前進接近、自動停止 | Not started 尚未開始 |
 | 6 | Safety manager, watchdog, emergency controls / 安全管理、看門狗、緊急控制 | Not started 尚未開始 |
 | 7 | Simulated BCI ErrP trigger / 模擬 BCI ErrP 觸發 | Stub only (key `B` toggles the HUD) 僅有雛型（按 `B` 切換 HUD） |
 | 8 | Real EEG streaming and ErrP classifier / 真實 EEG 串流與 ErrP 分類器 | Not started 尚未開始 |
 
-Milestones 1-2 **never take off and never send a movement command.** The point
-of Milestone 2 is to tune detection while standing on the ground with the
-object in your hand.
-里程碑 1-2 **絕不會起飛，也不會送出任何移動指令。** 里程碑 2 的目的是人站在地上、手上拿著目標物，先把偵測調好。
+Milestones 1-2 never took off. Milestone 3 **can** take off, but only if you
+pass ``--live``. The default is still ``DRY_RUN``: press `T` and the HUD walks
+GROUND → TAKEOFF → HOVER_SETTLE → SCANNING without spinning the motors.
+里程碑 1-2 不會起飛。里程碑 3 **可以**起飛，但只有加上 ``--live`` 才會真的動。
+預設仍是 ``DRY_RUN``：按 `T`，HUD 會走 GROUND → TAKEOFF → HOVER_SETTLE → SCANNING，馬達不會轉。
 
 ## Layout
 ## 目錄結構
@@ -38,6 +39,7 @@ tello_bci_project/
 ├── main.py                   entry point and main loop  # 進入點與主迴圈
 ├── config.py                 every tunable parameter  # 所有可調參數
 ├── drone/tello_controller.py the only module that talks to the drone  # 唯一跟無人機通訊的模組
+├── navigation/flight_supervisor.py  takeoff / hover / yaw-scan state machine  # 起飛／懸停／掃描狀態機
 ├── vision/detection.py       the Detection record and its geometry  # Detection 紀錄與其幾何量
 ├── vision/yolo_detector.py   ultralytics wrapper, frame -> detections  # ultralytics 包裝，影格 -> 偵測清單
 ├── vision/colour_filter.py   optional HSV colour validation  # 可選的 HSV 顏色驗證
@@ -91,7 +93,7 @@ python main.py --no-video            # telemetry only, if streaming fails  # 串
 python main.py --no-detect           # video without YOLO  # 有影像但不跑 YOLO
 python main.py --target bottle       # any of the 80 COCO classes  # 80 個 COCO 類別之一
 python main.py --colour              # require the target to be red  # 要求目標必須是紅色
-python main.py --live                # disable DRY_RUN (still no movement)  # 關閉 DRY_RUN（此階段仍無移動）
+python main.py --live                # real takeoff / scan. DRY_RUN off.  # 真正起飛／掃描，關閉 DRY_RUN
 ```
 
 An unknown `--target` exits immediately and prints the 80 class names the
@@ -104,9 +106,11 @@ keyboard hook would fire while you are typing in another application.
 
 | Key 按鍵 | Action 動作 |
 | --- | --- |
-| `Q` or `Esc` | Quit and shut down / 結束並安全關閉 |
-| `L` | Land (a no-op while DRY_RUN is on, verifies the command path) / 降落（DRY_RUN 時無作用，只驗證指令路徑） |
-| `B` | Simulate an ErrP trigger (HUD only for now) / 模擬 ErrP 觸發（目前只改 HUD） |
+| `T` | Takeoff → hover settle → yaw scan / 起飛 → 懸停穩定 → 偏航掃描 |
+| `L` | Land / 降落 |
+| `E` | Emergency: motors off, the drone drops / 緊急停止：切馬達，無人機會掉下來 |
+| `Q` or `Esc` | Land if flying, then quit / 若在飛先降落，再結束 |
+| `B` | Simulate an ErrP trigger (hover while scanning) / 模擬 ErrP（掃描中改為懸停） |
 | `R` | Clear the simulated BCI stop / 清除模擬的 BCI 停止 |
 | `C` | Toggle the colour filter without restarting / 不重開程式就能切換顏色濾鏡 |
 
@@ -127,16 +131,17 @@ detection, and an overlay:
 會開啟視窗，顯示相機畫面、中心十字準星、每個偵測的框，以及疊圖：
 
 ```text
-STATE: READY
-Battery: 74%
+STATE: GROUND
+Battery: 74%   H: 0 cm
 Loop:  61.2 fps   Video:  29.4 fps
 Link: OK
 Target: cup 0.87
 BBox ratio: 0.0412  err x=-118 y=+34
 Colour filter: OFF
+RC yaw=+0  lr=+0 fb=+0 ud=+0
 BCI: NORMAL p=0.00
 MODE: DRY_RUN (no movement)
-Q quit  L land  B ErrP  R reset  C colour
+T takeoff  L land  E emergency  Q quit  B ErrP  R  C
 ```
 
 Two rates are shown because they mean different things. **Loop** is how fast
@@ -158,6 +163,46 @@ Two files appear in `logs/`: `run_*.log` (diagnostics) and `flight_*.csv` (one
 row per frame, including the target class, confidence, box corners, box ratio
 and centring error).
 `logs/` 會出現兩個檔：`run_*.log`（診斷）與 `flight_*.csv`（每幀一列，含目標類別、信心、框角落、框比例、置中誤差）。
+
+## Milestone 3: takeoff, hover, yaw scan
+## 里程碑 3：起飛、懸停、偏航掃描
+
+The flight supervisor is an explicit state machine in
+`navigation/flight_supervisor.py`. It never talks to UDP; `TelloController`
+still swallows movement when `DRY_RUN` is on.
+飛行監督器是 `navigation/flight_supervisor.py` 裡的明確狀態機。它不碰 UDP；
+`DRY_RUN` 開啟時，`TelloController` 仍會吞掉移動指令。
+
+```text
+GROUND --T--> TAKEOFF --> HOVER_SETTLE --> SCANNING --target--> TARGET_LOCKED
+                                   |              |
+                                   |              +--timeout--> SCAN_TIMEOUT
+                                   |              +--B--> BCI_STOP (hover, R resumes)
+                                   |              +--video loss--> VIDEO_LOST (hover)
+                                   +--L / low battery / max time--> LANDING --> GROUND
+```
+
+**Always dry-run first.** Connect as usual, press `T`, confirm the HUD walks
+those states and `RC yaw` becomes about `+20` during SCANNING. Put a cup in
+front of the camera: after three consecutive detections the state should become
+`TARGET_LOCKED` and yaw should return to 0. Press `L` to go back to `GROUND`.
+**一定要先 dry-run。** 照常連線，按 `T`，確認 HUD 會走這些狀態，掃描時 `RC yaw` 大約 `+20`。
+把杯子放到鏡頭前：連續三幀偵測到之後應變成 `TARGET_LOCKED`，偏航回到 0。按 `L` 回到 `GROUND`。
+
+Only then, with a clear room, battery above 40%, textured floor, and the
+OpenCV window focused:
+
+```powershell
+python main.py --live
+```
+
+`E` cuts the motors. The drone will drop. That is the last resort, not a
+normal land.
+`E` 會切斷馬達，無人機會掉下來。那是最後手段，不是普通降落。
+
+Milestone 3 **does not fly towards the cup.** Locking the target only stops
+the yaw scan. Alignment is Milestone 4; approach is Milestone 5.
+里程碑 3 **不會朝杯子飛過去。** 鎖住目標只是停止偏航掃描。對齊是里程碑 4，接近是里程碑 5。
 
 ## Tuning detection
 ## 調整偵測
@@ -200,10 +245,10 @@ cd C:\Users\sam84\Documents\EEG\tello_bci_project
 python -m unittest discover -s tests -t . -v
 ```
 
-17 tests cover the bounding-box geometry, the selection ordering (including
-that it does not depend on the order YOLO returned the boxes in) and the HSV
-colour filter on both sides of the hue wrap-around.
-17 個測試涵蓋框幾何、選擇排序（包含不依賴 YOLO 回傳框的順序），以及色相繞回兩側的 HSV 顏色濾鏡。
+29 tests cover bounding-box geometry, target selection, the HSV colour filter,
+and the flight state machine (takeoff, scan yaw, lock, timeout, BCI hold,
+video-loss hold, low-battery land). None of them need a drone.
+29 個測試涵蓋框幾何、目標選擇、HSV 顏色濾鏡，以及飛行狀態機（起飛、掃描偏航、鎖定、逾時、BCI 暫停、影像中斷暫停、低電降落）。都不需要無人機。
 
 ## Troubleshooting
 ## 疑難排解
