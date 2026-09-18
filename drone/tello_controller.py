@@ -63,6 +63,26 @@ def _clamp(value: int, limit: int) -> int:
     return max(-100, min(100, limited))
 
 
+def rc_send_due(
+    last_cmd: Optional[tuple[int, int, int, int]],
+    last_sent_at: float,
+    command: tuple[int, int, int, int],
+    now: float,
+    min_interval: float,
+) -> bool:
+    """Whether a new UDP ``rc`` packet should go out.
+    是否該再送一包 UDP ``rc``。
+
+    A change is sent immediately so yaw can start and stop without waiting for
+    the next tick. Repeats are rate-limited so a 30 fps hover loop cannot fill
+    the socket buffer.
+    指令一變就立刻送，偏航才能馬上開始／停止。重複值會限速，避免 30 fps 的懸停迴圈塞滿 socket。
+    """
+    if last_cmd is None or command != last_cmd:
+        return True
+    return (now - last_sent_at) >= min_interval
+
+
 @dataclass
 class FrameResult:
     """One read from the video pipeline.
@@ -97,6 +117,9 @@ class TelloController:
         self._busy: bool = False
         self._airborne: bool = False
         self._last_rc: tuple[int, int, int, int] = (0, 0, 0, 0)
+        self._last_rc_sent: Optional[tuple[int, int, int, int]] = None
+        self._last_rc_sent_at: float = 0.0
+        self._rc_send_error_logged: bool = False
         self._worker: Optional[threading.Thread] = None
 
     # -- connection ---------------------------------------------------------
@@ -340,18 +363,29 @@ class TelloController:
         self.send_rc(0, 0, 0, 0)
 
     def send_rc(self, left_right: int, forward_back: int, up_down: int, yaw: int) -> None:
-        """Send a velocity command. Clamped, ignored while takeoff/land is busy.
-        送出速度指令。會夾限；起飛／降落進行中會忽略。
+        """Send a velocity command. Clamped, rate-limited, never raises on UDP errors.
+        送出速度指令。會夾限、限速；UDP 失敗不會拋到主迴圈。
         """
         lr = _clamp(left_right, config.MAX_FORWARD_SPEED)
         fb = _clamp(forward_back, config.MAX_FORWARD_SPEED)
         ud = _clamp(up_down, config.MAX_VERTICAL_SPEED)
         yw = _clamp(yaw, config.MAX_YAW_SPEED)
+        command = (lr, fb, ud, yw)
+        now = time.time()
+        min_interval = 1.0 / max(config.RC_SEND_HZ, 1.0)
+
         with self._lock:
-            self._last_rc = (lr, fb, ud, yw)
+            self._last_rc = command
             busy = self._busy
             airborne = self._airborne
             tello = self.tello
+            due = rc_send_due(
+                self._last_rc_sent,
+                self._last_rc_sent_at,
+                command,
+                now,
+                min_interval,
+            )
 
         if busy:
             return
@@ -359,7 +393,24 @@ class TelloController:
             return
         if tello is None or not airborne:
             return
-        tello.send_rc_control(lr, fb, ud, yw)
+        if not due:
+            return
+
+        try:
+            tello.send_rc_control(lr, fb, ud, yw)
+        except OSError as error:
+            # WinError 10055/10051 must not tear down the OpenCV window: land/E
+            # are the only way to recover while the drone is still in the air.
+            # WinError 10055/10051 絕不能把 OpenCV 視窗打掉：人還在空中時，降落／E 是唯一救援。
+            if not self._rc_send_error_logged:
+                LOGGER.error("RC send failed (%s); keeping the control loop alive", error)
+                self._rc_send_error_logged = True
+            return
+
+        with self._lock:
+            self._last_rc_sent = command
+            self._last_rc_sent_at = now
+            self._rc_send_error_logged = False
 
     def emergency(self) -> None:
         """Cut the motors immediately.
@@ -380,7 +431,10 @@ class TelloController:
         if self.dry_run:
             LOGGER.warning("[DRY_RUN] emergency() suppressed")
             return
-        tello.emergency()
+        try:
+            tello.emergency()
+        except OSError as error:
+            LOGGER.error("emergency() failed to send: %s", error)
 
     def _start_blocking(self, name: str, body, sets_airborne: bool) -> bool:
         with self._lock:

@@ -245,10 +245,9 @@ cd C:\Users\sam84\Documents\EEG\tello_bci_project
 python -m unittest discover -s tests -t . -v
 ```
 
-29 tests cover bounding-box geometry, target selection, the HSV colour filter,
-and the flight state machine (takeoff, scan yaw, lock, timeout, BCI hold,
-video-loss hold, low-battery land). None of them need a drone.
-29 個測試涵蓋框幾何、目標選擇、HSV 顏色濾鏡，以及飛行狀態機（起飛、掃描偏航、鎖定、逾時、BCI 暫停、影像中斷暫停、低電降落）。都不需要無人機。
+34 tests cover bounding-box geometry, target selection, the HSV colour filter,
+the flight state machine, and RC send-rate limiting. None of them need a drone.
+34 個測試涵蓋框幾何、目標選擇、HSV 顏色濾鏡、飛行狀態機，以及 RC 送出限速。都不需要無人機。
 
 ## Troubleshooting
 ## 疑難排解
@@ -266,6 +265,18 @@ taskkill /PID <PID from the last column> /F
 
 Packet Sender and this program cannot run at the same time.
 Packet Sender 與這個程式不能同時開。
+
+### `WinError 10055` / the window closes mid-flight
+### `WinError 10055`／飛行中視窗自己關掉
+
+An earlier build sent Tello ``rc`` on every display frame (~30 Hz). Windows
+UDP buffers filled, the main loop crashed, and land/E stopped working.
+`send_rc` is now capped at `RC_SEND_HZ` (10 Hz) and UDP errors are logged
+instead of tearing down the window. If a live flight still dies, land with
+the official Tello app, power-cycle the drone, then retry.
+舊版每個顯示幀都送 Tello ``rc``（約 30 Hz）。Windows UDP 緩衝區塞滿後主迴圈崩潰，降落／E 就失效。
+現在 `send_rc` 上限是 `RC_SEND_HZ`（10 Hz），UDP 錯誤只記 log、不拆視窗。
+若真飛仍當掉，用官方 Tello App 降落、重開無人機再試。
 
 ### `Tello did not respond`
 ### `Tello 沒有回應`

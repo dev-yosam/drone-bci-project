@@ -91,6 +91,14 @@ MIN_BATTERY_TAKEOFF: int = 40  # refuse to take off below this percentage  # 低
 MIN_BATTERY_ABORT: int = 20  # land immediately below this percentage  # 低於此電量立刻降落
 MAX_FLIGHT_TIME_S: float = 120.0  # hard cap on one autonomous run  # 單次自主飛行的硬上限
 COMMAND_WATCHDOG_S: float = 1.0  # no fresh command within this -> hover  # 超過這時間沒有新指令就懸停
+# Tello only needs RC a few times per second. The display loop runs ~30 Hz;
+# sending ``rc`` every frame flooded Windows UDP buffers (WinError 10055) and
+# killed a live flight. Keep this well above 1/COMMAND_WATCHDOG_S and far
+# below the video rate.
+# Tello 每秒只需幾次 RC。顯示迴圈約 30 Hz；每幀都送 ``rc`` 會塞爆 Windows
+# UDP 緩衝區（WinError 10055）並把真飛打掛。此值要高於 1/COMMAND_WATCHDOG_S，
+# 並遠低於影像幀率。
+RC_SEND_HZ: float = 10.0
 TARGET_LOST_FRAMES: int = 10  # consecutive misses before abandoning approach  # 連續幾幀找不到目標才放棄接近
 
 # Velocity clamps in the -100..100 units that Tello's `rc` command expects.
