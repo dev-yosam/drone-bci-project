@@ -69,7 +69,7 @@ VIDEO_RESOLUTION: str = "720p"  # "480p" or "720p"
 VIDEO_FPS: str = "30"  # "5", "15" or "30"
 VIDEO_BITRATE_MBPS: int = 0  # 0 = auto, otherwise 1-5  # 0 = 自動，否則 1-5
 
-WINDOW_NAME: str = "Tello BCI - Milestone 4"
+WINDOW_NAME: str = "Tello BCI - Milestone 5"
 # Tello streams 960x720. Scale the preview window without touching the frame
 # that later gets fed to YOLO.
 # Tello 串流解析度是 960x720。這裡只縮放預覽視窗，不會動到之後送進 YOLO 的影格。
@@ -179,8 +179,8 @@ ALIGN_MIN_UD: int = 8  # Tello ignores tiny ud the same way it ignores tiny yaw 
 MIN_DETECTION_FRAMES: int = 3  # consecutive hits before acting on a target  # 連續命中幾幀才開始對目標動作
 
 # ---------------------------------------------------------------------------
-# Forward approach (Milestone 5) - not used yet
-# 前進接近（里程碑 5）— 尚未使用
+# Forward approach (Milestone 5)
+# 前進接近（里程碑 5）
 # ---------------------------------------------------------------------------
 
 # IMPORTANT: these are ratios of bounding-box area to frame area. They are an
@@ -188,12 +188,23 @@ MIN_DETECTION_FRAMES: int = 3  # consecutive hits before acting on a target  # �
 # A large mug and a small mug stop at completely different real distances.
 # 重要：這些是「框面積 / 畫面面積」的比例。它只是影像空間裡「看起來比較近」的代理指標，
 # 不是真實距離。大馬克杯和小紙杯會在完全不同的實際距離停下來。
-APPROACH_THRESHOLD: float = 0.02  # below this the target is considered far  # 低於此值視為目標還很遠
-SLOW_DOWN_THRESHOLD: float = 0.08  # start easing off here  # 到這裡開始減速
-STOP_THRESHOLD: float = 0.15  # stop forward motion and hover  # 停止前進並懸停
+# Speed is FAST below APPROACH_THRESHOLD, eases linearly to SLOW at
+# SLOW_DOWN_THRESHOLD, stays SLOW until STOP_THRESHOLD, then 0.
+# 低於 APPROACH_THRESHOLD 用快速；到 SLOW_DOWN_THRESHOLD 線性降到慢速；
+# 慢速一直到 STOP_THRESHOLD，之後為 0。
+# Estimated from the Tello camera (82.6° diagonal FOV, 4:3) for an 8x10 cm cup:
+# 0.003 ~ 1.2 m, 0.008 ~ 0.8 m, 0.03 ~ 0.4 m. Verify on the HUD for your cup.
+# 依 Tello 鏡頭（對角 82.6°、4:3）與 8x10 公分杯子估算：
+# 0.003 約 1.2 m、0.008 約 0.8 m、0.03 約 0.4 m。請用 HUD 對你的杯子實測確認。
+APPROACH_THRESHOLD: float = 0.003  # below this the target is considered far  # 低於此值視為目標還很遠
+SLOW_DOWN_THRESHOLD: float = 0.008  # start easing off here  # 到這裡開始減速
+STOP_THRESHOLD: float = 0.03  # stop forward motion and hover  # 停止前進並懸停
 
 FAST_APPROACH_SPEED: int = 15  # clamped by MAX_FORWARD_SPEED  # 會被 MAX_FORWARD_SPEED 夾住
 SLOW_APPROACH_SPEED: int = 8
+# Give up and hover if the box never grows to STOP_THRESHOLD in this time.
+# 這段時間內框一直沒長到 STOP_THRESHOLD，就放棄並懸停。
+MAX_APPROACH_TIME_S: float = 15.0
 
 # ---------------------------------------------------------------------------
 # BCI / ErrP (Milestone 7 simulated, Milestone 8 real) - not used yet
