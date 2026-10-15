@@ -1,5 +1,5 @@
-"""Milestones 1-3: connect, detect the target, take off, hover, yaw-scan.
-里程碑 1-3：連線、偵測目標、起飛、懸停、偏航掃描。
+"""Milestones 1-4: connect, detect, take off, yaw-scan, yaw-align, then height-align.
+里程碑 1-4：連線、偵測、起飛、偏航掃描、偏航對齊，再高度對齊。
 
 Default is still DRY_RUN: the state machine runs and the HUD shows the RC
 that *would* be sent, but the motors never spin. Pass ``--live`` only when
@@ -9,18 +9,18 @@ you are ready to fly, with the OpenCV window focused and a clear floor.
 
 Run:  # 執行方式
     python main.py                       # station mode, DRY_RUN  # Station 模式，模擬飛行
-    python main.py --live                # real takeoff / scan  # 真正起飛／掃描
+    python main.py --live                # real takeoff / scan / align  # 真正起飛／掃描／對齊
     python main.py --host 192.168.10.1   # direct AP mode  # 直連 AP 模式
     python main.py --no-video            # telemetry only  # 只看遙測
     python main.py --no-detect           # video without YOLO  # 有影像但不跑 YOLO
     python main.py --colour              # enable the red-cup filter  # 開啟紅杯顏色濾鏡
 
 Keys (the OpenCV window must have focus):  # 按鍵（OpenCV 視窗必須在前景）
-    T        takeoff, then hover, then yaw scan  # 起飛 → 懸停 → 偏航掃描
+    T        takeoff, hover, yaw scan, then align  # 起飛 → 懸停 → 偏航掃描 → 對齊
     L        land  # 降落
     E        emergency (motors off, the drone drops)  # 緊急停止（切馬達，無人機會掉下來）
     Q / Esc  quit and shut down  # 結束並安全關閉
-    B        simulate an ErrP trigger (hover while scanning)  # 模擬 ErrP（掃描中改為懸停）
+    B        simulate an ErrP trigger (hover)  # 模擬 ErrP（改為懸停）
     R        clear the simulated BCI stop  # 清除模擬的 BCI 停止
     C        toggle the colour filter at runtime  # 執行中切換顏色濾鏡
 """
@@ -58,6 +58,7 @@ _STATE_COLOUR = {
     FlightState.TAKEOFF: viz.AMBER,
     FlightState.HOVER_SETTLE: viz.AMBER,
     FlightState.SCANNING: viz.AMBER,
+    FlightState.ALIGNING: viz.AMBER,
     FlightState.TARGET_LOCKED: viz.GREEN,
     FlightState.SCAN_TIMEOUT: viz.AMBER,
     FlightState.BCI_STOP: viz.RED,
@@ -68,12 +69,12 @@ _STATE_COLOUR = {
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Tello BCI project - Milestones 1-3")
+    parser = argparse.ArgumentParser(description="Tello BCI project - Milestones 1-4")
     parser.add_argument("--host", default=config.TELLO_HOST, help="Tello IP address / Tello IP 位址")
     parser.add_argument(
         "--live",
         action="store_true",
-        help="Disable DRY_RUN and allow takeoff / scan. / 關閉 DRY_RUN，允許起飛與掃描。",
+        help="Disable DRY_RUN and allow takeoff / scan / align. / 關閉 DRY_RUN，允許起飛、掃描與對齊。",
     )
     parser.add_argument("--no-video", action="store_true", help="Skip the video stream / 略過影像串流")
     parser.add_argument("--no-detect", action="store_true", help="Skip YOLO detection / 略過 YOLO 偵測")
@@ -268,6 +269,10 @@ def run(args: argparse.Namespace) -> int:
     video_on = config.VIDEO_ENABLED and not args.no_video
     detect_on = video_on and not args.no_detect
 
+    if args.live and not video_on:
+        LOGGER.error("LIVE mode requires video. Do not pass --no-video.")
+        return EXIT_ERROR
+
     if args.live and config.DRY_RUN:
         LOGGER.warning("LIVE MODE: motors can spin. Keep a clear floor and the window focused.")
     if dry_run:
@@ -324,6 +329,16 @@ def run(args: argparse.Namespace) -> int:
             controller.start_video()
         except TelloException as error:
             LOGGER.error("Video stream failed: %s", error)
+            if args.live:
+                LOGGER.error(
+                    "LIVE mode will not fly without a camera. Power-cycle the Tello, "
+                    "confirm Wi-Fi, then retry. Do not press T."
+                )
+                LOGGER.error(
+                    "LIVE 沒有影像就不能飛。請重開 Tello、確認 Wi-Fi 後再試。不要按 T。"
+                )
+                controller.shutdown()
+                return EXIT_ERROR
             LOGGER.error("Continuing without video. See the README for the AP-mode fallback.")
             video_on = False
             detect_on = False
@@ -364,6 +379,15 @@ def run(args: argparse.Namespace) -> int:
                     )
                     detections, selection = [], SelectionResult()
 
+                # Pixel offset from frame centre: +x is right, +y is below.
+                # 相對畫面中心的像素偏移：+x 在右，+y 在下。
+                error_x = None
+                error_y = None
+                if selection.target is not None:
+                    error_x, error_y = selection.target.error_from_centre(
+                        frame.shape[1], frame.shape[0]
+                    )
+
                 supervisor.step(
                     SupervisorInputs(
                         now=time.time(),
@@ -373,6 +397,8 @@ def run(args: argparse.Namespace) -> int:
                         video_ok=controller.video_ok if video_on else True,
                         video_on=video_on,
                         battery=controller.battery,
+                        error_x=error_x,
+                        error_y=error_y,
                     )
                 )
 
