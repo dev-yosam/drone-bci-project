@@ -8,9 +8,11 @@ transitions unit-testable with a fake controller.
 這樣 ``DRY_RUN`` 仍集中在一處，狀態轉移也可以用假控制器做單元測試。
 
 Milestone 4 yaws on ``error_x`` until the box is centred left-right, then after
-``TARGET_LOCKED`` uses ``error_y`` to climb or descend. Forward is still later.
+``TARGET_LOCKED`` uses ``error_y`` to climb or descend. Milestone 5 flies
+forward once both axes are centred, slowing as the box grows, and hovers in
+``ARRIVED`` when the box ratio reaches ``STOP_THRESHOLD``.
 里程碑 4 先用 ``error_x`` 轉到左右置中，進入 ``TARGET_LOCKED`` 後再用 ``error_y`` 升降。
-前進仍留給後面。
+里程碑 5 在兩軸都置中後往前飛，框越大越慢，框比例到 ``STOP_THRESHOLD`` 就在 ``ARRIVED`` 懸停。
 """
 
 from __future__ import annotations
@@ -32,6 +34,9 @@ class FlightState(str, Enum):
     SCANNING = "SCANNING"
     ALIGNING = "ALIGNING"
     TARGET_LOCKED = "TARGET_LOCKED"
+    APPROACHING = "APPROACHING"
+    ARRIVED = "ARRIVED"
+    APPROACH_TIMEOUT = "APPROACH_TIMEOUT"
     SCAN_TIMEOUT = "SCAN_TIMEOUT"
     BCI_STOP = "BCI_STOP"
     VIDEO_LOST = "VIDEO_LOST"
@@ -77,6 +82,7 @@ class SupervisorInputs:
     battery: Optional[int]
     error_x: Optional[float] = None
     error_y: Optional[float] = None
+    bbox_ratio: Optional[float] = None
 
 
 def _smoothed_p_command(
@@ -143,6 +149,27 @@ def ud_command_from_error(error_y: float, smoothed: float) -> tuple[int, float]:
     )
 
 
+def forward_speed_from_ratio(bbox_ratio: float) -> int:
+    """Forward RC speed from how much of the frame the box fills.
+    依框佔畫面的比例決定前進 RC 速度。
+
+    A bigger box means the target looks closer, so the drone slows down and
+    finally stops. This is an image-space proxy, not a distance in metres.
+    框越大代表目標看起來越近，所以減速並最終停下。這是影像空間的代理指標，不是公尺距離。
+    """
+    fast = min(config.FAST_APPROACH_SPEED, config.MAX_FORWARD_SPEED)
+    slow = min(config.SLOW_APPROACH_SPEED, config.MAX_FORWARD_SPEED)
+    if bbox_ratio >= config.STOP_THRESHOLD:
+        return 0
+    if bbox_ratio >= config.SLOW_DOWN_THRESHOLD:
+        return slow
+    if bbox_ratio <= config.APPROACH_THRESHOLD:
+        return fast
+    span = config.SLOW_DOWN_THRESHOLD - config.APPROACH_THRESHOLD
+    t = (bbox_ratio - config.APPROACH_THRESHOLD) / span
+    return int(round(fast + (slow - fast) * t))
+
+
 class FlightSupervisor:
     def __init__(self, controller: DroneLike) -> None:
         self.controller = controller
@@ -158,6 +185,8 @@ class FlightSupervisor:
         self._last_align_yaw: int = 0
         self._smoothed_ud: float = 0.0
         self._last_align_ud: int = 0
+        self._approach_started_at: Optional[float] = None
+        self._last_approach_rc: tuple[int, int, int, int] = (0, 0, 0, 0)
         self._resume_after_hold: Optional[FlightState] = None
 
     @property
@@ -198,7 +227,13 @@ class FlightSupervisor:
             self._step_aligning(inputs)
         elif self.state is FlightState.TARGET_LOCKED:
             self._step_target_locked(inputs)
-        elif self.state is FlightState.SCAN_TIMEOUT:
+        elif self.state is FlightState.APPROACHING:
+            self._step_approaching(inputs)
+        elif self.state in (
+            FlightState.ARRIVED,
+            FlightState.APPROACH_TIMEOUT,
+            FlightState.SCAN_TIMEOUT,
+        ):
             self.controller.hover()
         elif self.state is FlightState.BCI_STOP:
             self._step_bci_stop(inputs)
@@ -325,6 +360,7 @@ class FlightSupervisor:
 
     def _begin_locked(self) -> None:
         self._miss_streak = 0
+        self._align_streak = 0
         self._smoothed_ud = 0.0
         self._last_align_ud = 0
         self._enter(FlightState.TARGET_LOCKED)
@@ -357,10 +393,80 @@ class FlightSupervisor:
                         inputs.error_y, self._smoothed_ud
                     )
                     self._last_align_ud = ud
+                    if abs(inputs.error_y) <= config.ALIGNMENT_TOLERANCE_PX:
+                        self._align_streak += 1
+                    else:
+                        self._align_streak = 0
+                    if self._align_streak >= config.MIN_DETECTION_FRAMES:
+                        LOGGER.info("Height centred, approaching")
+                        self._begin_approach(inputs.now)
+                        self._step_approaching(inputs)
+                        return
 
-        # Height only after yaw lock. Never command forward.
-        # 偏航鎖定後才調高度。絕不送前進。
+        # Height only after yaw lock. Forward waits until height is centred too.
+        # 偏航鎖定後才調高度。高度也置中之後才前進。
         self.controller.send_rc(0, 0, self._last_align_ud, 0)
+
+    def _begin_approach(self, now: float) -> None:
+        self._miss_streak = 0
+        self._smoothed_yaw = 0.0
+        self._smoothed_ud = 0.0
+        self._approach_started_at = now
+        self._last_approach_rc = (0, 0, 0, 0)
+        self._enter(FlightState.APPROACHING)
+
+    def _step_approaching(self, inputs: SupervisorInputs) -> None:
+        # Holds resume at TARGET_LOCKED, never mid-flight: re-centre before moving again.
+        # 暫停後一律回到 TARGET_LOCKED，不直接續飛：先重新置中再前進。
+        if inputs.bci_stopped:
+            self._hold(FlightState.BCI_STOP, resume=FlightState.TARGET_LOCKED)
+            return
+        if inputs.video_on and not inputs.video_ok:
+            self._hold(FlightState.VIDEO_LOST, resume=FlightState.TARGET_LOCKED)
+            return
+
+        if self._approach_started_at is None:
+            self._approach_started_at = inputs.now
+        if inputs.now - self._approach_started_at >= config.MAX_APPROACH_TIME_S:
+            LOGGER.warning("Approach timed out after %.1fs", config.MAX_APPROACH_TIME_S)
+            self.safety_trigger = "approach_timeout"
+            self.controller.hover()
+            self._enter(FlightState.APPROACH_TIMEOUT)
+            return
+
+        if inputs.detection_tick:
+            if not inputs.target_found or inputs.error_x is None or inputs.bbox_ratio is None:
+                # Never keep flying forward on a stale box.
+                # 絕不拿過期的框繼續往前飛。
+                self._last_approach_rc = (0, 0, 0, 0)
+                self._miss_streak += 1
+                if self._miss_streak >= config.TARGET_LOST_FRAMES:
+                    LOGGER.info("Target lost while approaching, resume scan")
+                    self._return_to_scan(inputs.now)
+                    self._step_scanning(inputs)
+                    return
+            else:
+                self._miss_streak = 0
+                if inputs.bbox_ratio >= config.STOP_THRESHOLD:
+                    LOGGER.info("Arrived: bbox ratio %.3f >= %.3f",
+                                inputs.bbox_ratio, config.STOP_THRESHOLD)
+                    self.controller.hover()
+                    self._enter(FlightState.ARRIVED)
+                    return
+                if abs(inputs.error_x) > config.ALIGN_REACQUIRE_PX:
+                    LOGGER.info("Target drifted (err x=%.0f) while approaching, realigning",
+                                inputs.error_x)
+                    self._begin_aligning()
+                    self._step_aligning(inputs)
+                    return
+                yaw, self._smoothed_yaw = yaw_command_from_error(inputs.error_x, self._smoothed_yaw)
+                ud = 0
+                if inputs.error_y is not None:
+                    ud, self._smoothed_ud = ud_command_from_error(inputs.error_y, self._smoothed_ud)
+                fb = forward_speed_from_ratio(inputs.bbox_ratio)
+                self._last_approach_rc = (0, fb, ud, yaw)
+
+        self.controller.send_rc(*self._last_approach_rc)
 
     def _return_to_scan(self, now: float) -> None:
         self._hit_streak = 0
@@ -370,6 +476,8 @@ class FlightSupervisor:
         self._last_align_yaw = 0
         self._smoothed_ud = 0.0
         self._last_align_ud = 0
+        self._approach_started_at = None
+        self._last_approach_rc = (0, 0, 0, 0)
         self._scan_started_at = now
         self.controller.hover()
         self._enter(FlightState.SCANNING)
@@ -411,6 +519,9 @@ class FlightSupervisor:
         self._resume_after_hold = None
         if nxt is FlightState.SCANNING:
             self._hit_streak = 0
+        if nxt is FlightState.TARGET_LOCKED:
+            self._begin_locked()
+            return
         self._enter(nxt)
 
     def _enter(self, new_state: FlightState) -> None:
@@ -429,4 +540,6 @@ class FlightSupervisor:
             self._last_align_yaw = 0
             self._smoothed_ud = 0.0
             self._last_align_ud = 0
+            self._approach_started_at = None
+            self._last_approach_rc = (0, 0, 0, 0)
             self._resume_after_hold = None

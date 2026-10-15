@@ -15,6 +15,7 @@ from navigation.flight_supervisor import (  # noqa: E402
     FlightState,
     FlightSupervisor,
     SupervisorInputs,
+    forward_speed_from_ratio,
     ud_command_from_error,
     yaw_command_from_error,
 )
@@ -69,6 +70,7 @@ def inputs(
     battery: int = 80,
     error_x: float | None = None,
     error_y: float | None = None,
+    bbox_ratio: float | None = None,
 ) -> SupervisorInputs:
     return SupervisorInputs(
         now=now,
@@ -80,6 +82,7 @@ def inputs(
         battery=battery,
         error_x=error_x,
         error_y=error_y,
+        bbox_ratio=bbox_ratio,
     )
 
 
@@ -309,6 +312,101 @@ class FlightSupervisorTests(unittest.TestCase):
         self.sup.step(inputs(t + 0.2, bci_stopped=False, target_found=True, error_x=200.0))
         self.assertEqual(self.sup.state, FlightState.ALIGNING)
 
+    def _into_approaching(self, bbox_ratio: float = 0.001) -> float:
+        t = self._into_locked(error_y=0.0)
+        for i in range(config.MIN_DETECTION_FRAMES):
+            self.sup.step(
+                inputs(
+                    t + (i + 1) * 0.1,
+                    target_found=True,
+                    detection_tick=True,
+                    error_x=0.0,
+                    error_y=0.0,
+                    bbox_ratio=bbox_ratio,
+                )
+            )
+        self.assertEqual(self.sup.state, FlightState.APPROACHING)
+        return t + config.MIN_DETECTION_FRAMES * 0.1
+
+    def test_locked_does_not_fly_forward_until_height_centred(self):
+        t = self._into_locked(error_y=200.0)
+        self.sup.step(
+            inputs(t + 0.1, target_found=True, detection_tick=True,
+                   error_x=0.0, error_y=200.0, bbox_ratio=0.001)
+        )
+        self.assertEqual(self.sup.state, FlightState.TARGET_LOCKED)
+        self.assertEqual(self.drone.last_rc[1], 0)
+
+    def test_centred_lock_starts_forward_approach(self):
+        self._into_approaching(bbox_ratio=0.001)
+        lr, fb, ud, yaw = self.drone.last_rc
+        self.assertEqual(lr, 0)
+        self.assertEqual(fb, min(config.FAST_APPROACH_SPEED, config.MAX_FORWARD_SPEED))
+
+    def test_approach_keeps_correcting_yaw_and_height(self):
+        t = self._into_approaching()
+        self.sup.step(
+            inputs(t + 0.1, target_found=True, detection_tick=True,
+                   error_x=70.0, error_y=-70.0, bbox_ratio=0.001)
+        )
+        self.assertEqual(self.sup.state, FlightState.APPROACHING)
+        lr, fb, ud, yaw = self.drone.last_rc
+        self.assertGreater(fb, 0)
+        self.assertGreater(yaw, 0)
+        self.assertGreater(ud, 0)
+
+    def test_big_box_arrives_and_hovers(self):
+        t = self._into_approaching()
+        self.sup.step(
+            inputs(t + 0.1, target_found=True, detection_tick=True,
+                   error_x=0.0, error_y=0.0, bbox_ratio=config.STOP_THRESHOLD)
+        )
+        self.assertEqual(self.sup.state, FlightState.ARRIVED)
+        self.assertEqual(self.drone.last_rc, (0, 0, 0, 0))
+        self.sup.step(inputs(t + 0.2))
+        self.assertEqual(self.drone.last_rc, (0, 0, 0, 0))
+
+    def test_missed_detection_stops_forward_immediately(self):
+        t = self._into_approaching()
+        self.sup.step(inputs(t + 0.1, target_found=False, detection_tick=True))
+        self.assertEqual(self.sup.state, FlightState.APPROACHING)
+        self.assertEqual(self.drone.last_rc, (0, 0, 0, 0))
+
+    def test_lost_target_while_approaching_returns_to_scan(self):
+        t = self._into_approaching()
+        for i in range(config.TARGET_LOST_FRAMES):
+            self.sup.step(inputs(t + (i + 1) * 0.1, target_found=False, detection_tick=True))
+        self.assertEqual(self.sup.state, FlightState.SCANNING)
+        self.assertEqual(self.drone.last_rc[1], 0)
+
+    def test_drift_while_approaching_realigns_without_forward(self):
+        t = self._into_approaching()
+        self.sup.step(
+            inputs(t + 0.1, target_found=True, detection_tick=True,
+                   error_x=float(config.ALIGN_REACQUIRE_PX + 40), error_y=0.0, bbox_ratio=0.001)
+        )
+        self.assertEqual(self.sup.state, FlightState.ALIGNING)
+        self.assertEqual(self.drone.last_rc[1], 0)
+
+    def test_approach_timeout_hovers(self):
+        t = self._into_approaching()
+        self.sup.step(
+            inputs(t + config.MAX_APPROACH_TIME_S + 0.1, target_found=True, detection_tick=True,
+                   error_x=0.0, error_y=0.0, bbox_ratio=0.001)
+        )
+        self.assertEqual(self.sup.state, FlightState.APPROACH_TIMEOUT)
+        self.assertEqual(self.sup.safety_trigger, "approach_timeout")
+        self.assertEqual(self.drone.last_rc, (0, 0, 0, 0))
+
+    def test_bci_stop_while_approaching_resumes_at_lock(self):
+        t = self._into_approaching()
+        self.sup.step(inputs(t + 0.1, bci_stopped=True))
+        self.assertEqual(self.sup.state, FlightState.BCI_STOP)
+        self.assertEqual(self.drone.last_rc, (0, 0, 0, 0))
+        self.sup.step(inputs(t + 0.2, bci_stopped=False))
+        self.assertEqual(self.sup.state, FlightState.TARGET_LOCKED)
+        self.assertEqual(self.drone.last_rc[1], 0)
+
     def test_takeoff_failure_returns_to_ground(self):
         self.drone.takeoff()
         self.drone.airborne = False
@@ -371,6 +469,28 @@ class UdCommandTests(unittest.TestCase):
     def test_clamped_to_max_vertical(self):
         cmd, _ = ud_command_from_error(10_000.0, 0.0)
         self.assertLessEqual(abs(cmd), config.MAX_VERTICAL_SPEED)
+
+
+class ForwardSpeedTests(unittest.TestCase):
+    def test_far_target_is_fast(self):
+        self.assertEqual(
+            forward_speed_from_ratio(config.APPROACH_THRESHOLD / 2),
+            min(config.FAST_APPROACH_SPEED, config.MAX_FORWARD_SPEED),
+        )
+
+    def test_speed_eases_down_between_thresholds(self):
+        mid = (config.APPROACH_THRESHOLD + config.SLOW_DOWN_THRESHOLD) / 2
+        speed = forward_speed_from_ratio(mid)
+        self.assertLess(speed, config.FAST_APPROACH_SPEED)
+        self.assertGreater(speed, config.SLOW_APPROACH_SPEED)
+
+    def test_near_target_is_slow(self):
+        mid = (config.SLOW_DOWN_THRESHOLD + config.STOP_THRESHOLD) / 2
+        self.assertEqual(forward_speed_from_ratio(mid), config.SLOW_APPROACH_SPEED)
+
+    def test_stop_threshold_is_zero(self):
+        self.assertEqual(forward_speed_from_ratio(config.STOP_THRESHOLD), 0)
+        self.assertEqual(forward_speed_from_ratio(0.9), 0)
 
 
 if __name__ == "__main__":
