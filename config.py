@@ -69,7 +69,7 @@ VIDEO_RESOLUTION: str = "720p"  # "480p" or "720p"
 VIDEO_FPS: str = "30"  # "5", "15" or "30"
 VIDEO_BITRATE_MBPS: int = 0  # 0 = auto, otherwise 1-5  # 0 = 自動，否則 1-5
 
-WINDOW_NAME: str = "Tello BCI - Milestone 3"
+WINDOW_NAME: str = "Tello BCI - Milestone 4"
 # Tello streams 960x720. Scale the preview window without touching the frame
 # that later gets fed to YOLO.
 # Tello 串流解析度是 960x720。這裡只縮放預覽視窗，不會動到之後送進 YOLO 的影格。
@@ -158,13 +158,24 @@ MAX_SCAN_TIME_S: float = 60.0
 HOVER_SETTLE_S: float = 2.0  # let the drone stabilise before acting on video  # 先讓無人機穩定，再依影像動作
 
 # ---------------------------------------------------------------------------
-# Visual servoing (Milestone 4) - not used yet
-# 視覺伺服（里程碑 4）— 尚未使用
+# Visual servoing (Milestone 4)
+# 視覺伺服（里程碑 4）
 # ---------------------------------------------------------------------------
 
 ALIGNMENT_TOLERANCE_PX: int = 40  # deadband around the frame centre  # 畫面中心附近的死區
+# Leave TARGET_LOCKED and resume aligning if the error grows past this.
+# 誤差超過此值就離開 TARGET_LOCKED，重新對齊。
+ALIGN_REACQUIRE_PX: int = 80
 KP_YAW: float = 0.08  # yaw_command = KP_YAW * error_x, then clamped  # 偏航指令 = KP_YAW * error_x，再夾限
 YAW_SMOOTHING: float = 0.6  # 0 = no smoothing, ->1 = heavy smoothing  # 0 = 不平滑，越接近 1 越平滑
+# Tello often ignores rc yaw of 1-5. When outside the deadband, never command less than this.
+# Tello 常常不理 1-5 的 rc 偏航。在死區外，指令不小於這個值。
+ALIGN_MIN_YAW: int = 8
+# After yaw lock, P-control height from error_y. Invert vs image y: target below
+# centre (positive error_y) means descend.
+# 偏航鎖定後，用 error_y 做 P 控制升降。與影像 y 相反：目標在中心下方（error_y 為正）就下降。
+KP_VERTICAL: float = 0.08
+ALIGN_MIN_UD: int = 8  # Tello ignores tiny ud the same way it ignores tiny yaw  # 太小的升降跟太小的偏航一樣常被忽略
 MIN_DETECTION_FRAMES: int = 3  # consecutive hits before acting on a target  # 連續命中幾幀才開始對目標動作
 
 # ---------------------------------------------------------------------------

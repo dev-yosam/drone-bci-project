@@ -8,8 +8,8 @@ EEG ErrP detector is added later as a human-in-the-loop safety veto.
 之後會加入 32 通道 EEG ErrP 偵測器，作為人在迴路中的安全否決。
 
 The project is built milestone by milestone. **This repository currently
-implements Milestones 1, 2 and 3.**
-專案依里程碑逐步建構。**目前這個儲存庫已實作里程碑 1、2 與 3。**
+implements Milestones 1, 2, 3 and 4.**
+專案依里程碑逐步建構。**目前這個儲存庫已實作里程碑 1、2、3 與 4。**
 
 ## Current status
 ## 目前進度
@@ -19,17 +19,23 @@ implements Milestones 1, 2 and 3.**
 | 1 | Connect, video stream, display, battery, safe shutdown / 連線、影像串流、顯示、電量、安全關閉 | Implemented 已完成 |
 | 2 | YOLO detection, colour filter, target selection / YOLO 偵測、顏色濾鏡、目標選擇 | Implemented 已完成 |
 | 3 | Takeoff, hover, yaw scan / 起飛、懸停、偏航掃描 | Implemented 已完成 |
-| 4 | Visual servo yaw alignment / 視覺伺服偏航對齊 | Not started 尚未開始 |
+| 4 | Visual servo yaw then height alignment / 視覺伺服：先偏航再對高度 | Implemented 已完成 |
 | 5 | Forward approach, automatic stop / 前進接近、自動停止 | Not started 尚未開始 |
 | 6 | Safety manager, watchdog, emergency controls / 安全管理、看門狗、緊急控制 | Not started 尚未開始 |
 | 7 | Simulated BCI ErrP trigger / 模擬 BCI ErrP 觸發 | Stub only (key `B` toggles the HUD) 僅有雛型（按 `B` 切換 HUD） |
 | 8 | Real EEG streaming and ErrP classifier / 真實 EEG 串流與 ErrP 分類器 | Not started 尚未開始 |
 
 Milestones 1-2 never took off. Milestone 3 **can** take off, but only if you
-pass ``--live``. The default is still ``DRY_RUN``: press `T` and the HUD walks
-GROUND → TAKEOFF → HOVER_SETTLE → SCANNING without spinning the motors.
+pass ``--live``. Milestone 4 adds yaw alignment after the scan finds the cup, then height
+alignment after lock: the drone turns until ``err x`` is centred, then climbs
+or descends until ``err y`` is centred, then hovers. It still does **not**
+fly forward; that is Milestone 5. The default is still
+``DRY_RUN``: press `T` and the HUD walks GROUND → TAKEOFF → HOVER_SETTLE →
+SCANNING → ALIGNING without spinning the motors.
 里程碑 1-2 不會起飛。里程碑 3 **可以**起飛，但只有加上 ``--live`` 才會真的動。
-預設仍是 ``DRY_RUN``：按 `T`，HUD 會走 GROUND → TAKEOFF → HOVER_SETTLE → SCANNING，馬達不會轉。
+里程碑 4 在掃描找到杯子後先偏航對齊 ``err x``，鎖定後再升降對齊 ``err y``，然後懸停。
+**仍不會前進**；前進是里程碑 5。預設仍是 ``DRY_RUN``：按 `T`，HUD 會走
+GROUND → TAKEOFF → HOVER_SETTLE → SCANNING → ALIGNING，馬達不會轉。
 
 ## Layout
 ## 目錄結構
@@ -39,7 +45,7 @@ tello_bci_project/
 ├── main.py                   entry point and main loop  # 進入點與主迴圈
 ├── config.py                 every tunable parameter  # 所有可調參數
 ├── drone/tello_controller.py the only module that talks to the drone  # 唯一跟無人機通訊的模組
-├── navigation/flight_supervisor.py  takeoff / hover / yaw-scan state machine  # 起飛／懸停／掃描狀態機
+├── navigation/flight_supervisor.py  takeoff / hover / scan / align state machine  # 起飛／懸停／掃描／對齊狀態機
 ├── vision/detection.py       the Detection record and its geometry  # Detection 紀錄與其幾何量
 ├── vision/yolo_detector.py   ultralytics wrapper, frame -> detections  # ultralytics 包裝，影格 -> 偵測清單
 ├── vision/colour_filter.py   optional HSV colour validation  # 可選的 HSV 顏色驗證
@@ -93,7 +99,7 @@ python main.py --no-video            # telemetry only, if streaming fails  # 串
 python main.py --no-detect           # video without YOLO  # 有影像但不跑 YOLO
 python main.py --target bottle       # any of the 80 COCO classes  # 80 個 COCO 類別之一
 python main.py --colour              # require the target to be red  # 要求目標必須是紅色
-python main.py --live                # real takeoff / scan. DRY_RUN off.  # 真正起飛／掃描，關閉 DRY_RUN
+python main.py --live                # real takeoff / scan / align. DRY_RUN off.  # 真正起飛／掃描／對齊，關閉 DRY_RUN
 ```
 
 An unknown `--target` exits immediately and prints the 80 class names the
@@ -106,11 +112,11 @@ keyboard hook would fire while you are typing in another application.
 
 | Key 按鍵 | Action 動作 |
 | --- | --- |
-| `T` | Takeoff → hover settle → yaw scan / 起飛 → 懸停穩定 → 偏航掃描 |
+| `T` | Takeoff → hover settle → yaw scan → align / 起飛 → 懸停穩定 → 偏航掃描 → 對齊 |
 | `L` | Land / 降落 |
 | `E` | Emergency: motors off, the drone drops / 緊急停止：切馬達，無人機會掉下來 |
 | `Q` or `Esc` | Land if flying, then quit / 若在飛先降落，再結束 |
-| `B` | Simulate an ErrP trigger (hover while scanning) / 模擬 ErrP（掃描中改為懸停） |
+| `B` | Simulate an ErrP trigger (hover) / 模擬 ErrP（改為懸停） |
 | `R` | Clear the simulated BCI stop / 清除模擬的 BCI 停止 |
 | `C` | Toggle the colour filter without restarting / 不重開程式就能切換顏色濾鏡 |
 
@@ -153,10 +159,10 @@ how fresh the image is, which is why the CSV records that one.
 
 The selected target is outlined in green with a line drawn from the frame
 centre to the target centre - that line is the alignment error the yaw
-controller will act on in Milestone 4. Other detections are outlined in amber.
+controller acts on. Other detections are outlined in amber.
 Rejected objects are still drawn on purpose: when the drone ignores something,
 you need to see whether it was never detected or detected and then rejected.
-被選中的目標用綠框，並從畫面中心連一線到目標中心——這條線就是里程碑 4 偏航控制器會處理的對齊誤差。
+被選中的目標用綠框，並從畫面中心連一線到目標中心——這條線就是偏航控制器處理的對齊誤差。
 其他偵測用黃框。被拒絕的物件也刻意畫出來：無人機忽略某物時，你必須看得出是「從沒偵測到」還是「偵測到後被拒」。
 
 Two files appear in `logs/`: `run_*.log` (diagnostics) and `flight_*.csv` (one
@@ -174,8 +180,9 @@ still swallows movement when `DRY_RUN` is on.
 `DRY_RUN` 開啟時，`TelloController` 仍會吞掉移動指令。
 
 ```text
-GROUND --T--> TAKEOFF --> HOVER_SETTLE --> SCANNING --target--> TARGET_LOCKED
-                                   |              |
+GROUND --T--> TAKEOFF --> HOVER_SETTLE --> SCANNING --target--> ALIGNING --centred--> TARGET_LOCKED
+                                   |              |                 |
+                                   |              |                 +--lost / drift--> SCANNING / ALIGNING
                                    |              +--timeout--> SCAN_TIMEOUT
                                    |              +--B--> BCI_STOP (hover, R resumes)
                                    |              +--video loss--> VIDEO_LOST (hover)
@@ -185,9 +192,11 @@ GROUND --T--> TAKEOFF --> HOVER_SETTLE --> SCANNING --target--> TARGET_LOCKED
 **Always dry-run first.** Connect as usual, press `T`, confirm the HUD walks
 those states and `RC yaw` becomes about `+20` during SCANNING. Put a cup in
 front of the camera: after three consecutive detections the state should become
-`TARGET_LOCKED` and yaw should return to 0. Press `L` to go back to `GROUND`.
+`ALIGNING`, yaw should follow `err x`, and once the cup sits in the centre
+deadband it should become `TARGET_LOCKED` with yaw 0. Press `L` to go back
+to `GROUND`.
 **一定要先 dry-run。** 照常連線，按 `T`，確認 HUD 會走這些狀態，掃描時 `RC yaw` 大約 `+20`。
-把杯子放到鏡頭前：連續三幀偵測到之後應變成 `TARGET_LOCKED`，偏航回到 0。按 `L` 回到 `GROUND`。
+把杯子放到鏡頭前：連續三幀偵測到之後應變成 `ALIGNING`，偏航跟隨 `err x`，杯子進中心死區後變成 `TARGET_LOCKED`、偏航回到 0。按 `L` 回到 `GROUND`。
 
 Only then, with a clear room, battery above 40%, textured floor, and the
 OpenCV window focused:
@@ -200,9 +209,50 @@ python main.py --live
 normal land.
 `E` 會切斷馬達，無人機會掉下來。那是最後手段，不是普通降落。
 
-Milestone 3 **does not fly towards the cup.** Locking the target only stops
-the yaw scan. Alignment is Milestone 4; approach is Milestone 5.
-里程碑 3 **不會朝杯子飛過去。** 鎖住目標只是停止偏航掃描。對齊是里程碑 4，接近是里程碑 5。
+Milestone 4 **does not fly towards the cup.** It yaws in place, then after lock
+climbs or descends to centre the cup vertically. Forward approach is Milestone 5.
+里程碑 4 **不會朝杯子飛過去。** 先原地轉，鎖定後再升降把杯子上下置中。前進接近是里程碑 5。
+
+## Milestone 4: yaw then height alignment
+## 里程碑 4：先偏航、再高度對齊
+
+After `SCANNING` has seen the target for `MIN_DETECTION_FRAMES` consecutive
+detections, the supervisor enters `ALIGNING`. Yaw is
+
+```text
+yaw = clamp(KP_YAW * error_x, ±MAX_YAW_SPEED)
+```
+
+then exponentially smoothed with `YAW_SMOOTHING`. Positive `error_x` means the
+cup is to the right of centre, so yaw is clockwise. Inside
+`ALIGNMENT_TOLERANCE_PX` the command is 0; after that many consecutive centred
+frames the state becomes `TARGET_LOCKED`. Height is not touched until then.
+掃描連續看到目標 `MIN_DETECTION_FRAMES` 幀後，監督器進入 `ALIGNING`。偏航為
+`yaw = clamp(KP_YAW * error_x, ±MAX_YAW_SPEED)`，再以 `YAW_SMOOTHING` 做指數平滑。
+`error_x` 為正代表杯子在畫面中心右側，所以順時針轉。進入 `ALIGNMENT_TOLERANCE_PX`
+死區後指令為 0；連續置中夠久就變成 `TARGET_LOCKED`。在此之前不調高度。
+
+Once locked, up/down is
+
+```text
+ud = clamp(-KP_VERTICAL * error_y, ±MAX_VERTICAL_SPEED)
+```
+
+Positive `error_y` means the cup is below centre (image y grows downward), so
+the drone descends. Takeoff height is left to the Tello `takeoff` command;
+this loop only centres the box on screen. Lose the target for
+`TARGET_LOST_FRAMES` and it returns to `SCANNING`. If the cup later drifts
+past `ALIGN_REACQUIRE_PX` horizontally, it goes back to `ALIGNING` (yaw first).
+鎖定後升降為 `ud = clamp(-KP_VERTICAL * error_y, ±MAX_VERTICAL_SPEED)`。
+`error_y` 為正代表杯子在畫面中心下方（影像 y 向下增加），所以下降。
+起飛高度仍交給 Tello 的 `takeoff`；這段迴圈只把框對到畫面中央。連續
+`TARGET_LOST_FRAMES` 幀找不到目標就回到 `SCANNING`。之後若左右漂出
+`ALIGN_REACQUIRE_PX`，先回到 `ALIGNING` 轉偏航。
+
+Tunables live in `config.py`: `ALIGNMENT_TOLERANCE_PX`, `KP_YAW`, `KP_VERTICAL`,
+`YAW_SMOOTHING`, `ALIGN_MIN_YAW`, `ALIGN_MIN_UD`, `ALIGN_REACQUIRE_PX`.
+可調參數在 `config.py`：`ALIGNMENT_TOLERANCE_PX`、`KP_YAW`、`KP_VERTICAL`、
+`YAW_SMOOTHING`、`ALIGN_MIN_YAW`、`ALIGN_MIN_UD`、`ALIGN_REACQUIRE_PX`。
 
 ## Tuning detection
 ## 調整偵測
@@ -245,9 +295,10 @@ cd C:\Users\sam84\Documents\EEG\tello_bci_project
 python -m unittest discover -s tests -t . -v
 ```
 
-34 tests cover bounding-box geometry, target selection, the HSV colour filter,
-the flight state machine, and RC send-rate limiting. None of them need a drone.
-34 個測試涵蓋框幾何、目標選擇、HSV 顏色濾鏡、飛行狀態機，以及 RC 送出限速。都不需要無人機。
+52 tests cover bounding-box geometry, target selection, the HSV colour filter,
+the flight state machine (including yaw and height alignment), and RC send-rate
+limiting. None of them need a drone.
+52 個測試涵蓋框幾何、目標選擇、HSV 顏色濾鏡、飛行狀態機（含偏航與高度對齊），以及 RC 送出限速。都不需要無人機。
 
 ## Troubleshooting
 ## 疑難排解
@@ -277,6 +328,19 @@ the official Tello app, power-cycle the drone, then retry.
 舊版每個顯示幀都送 Tello ``rc``（約 30 Hz）。Windows UDP 緩衝區塞滿後主迴圈崩潰，降落／E 就失效。
 現在 `send_rc` 上限是 `RC_SEND_HZ`（10 Hz），UDP 錯誤只記 log、不拆視窗。
 若真飛仍當掉，用官方 Tello App 降落、重開無人機再試。
+
+### `VIDEO DISABLED` / `Battery: --%` / `SDK 0` in LIVE
+### LIVE 出現 `VIDEO DISABLED`／`Battery: --%`／`SDK 0`
+
+The control hello (`command`) can succeed while video, battery and SDK queries
+are already dead. That is not a flyable link. An earlier run now **exits**
+instead of opening a LIVE window without a camera, and `T` is refused without
+frames. Power-cycle the Tello, join `WiFi-D73C60`, `ping 192.168.0.220`, then
+retry. Do not press `T` until HUD shows a real battery percent and Video near 30 fps.
+控制通道的 `command` 握手可能成功，但影像、電量、SDK 查詢已經掛了。那不是可飛的連線。
+現在這種情況會**直接結束**，不會再開一個沒鏡頭的 LIVE 視窗；沒有影格時按 `T` 也會被拒。
+請重開 Tello、連 `WiFi-D73C60`、`ping 192.168.0.220`，然後重試。
+HUD 要看到真實電量、Video 接近 30 fps，才按 `T`。
 
 ### `Tello did not respond`
 ### `Tello 沒有回應`

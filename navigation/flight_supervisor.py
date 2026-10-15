@@ -1,11 +1,16 @@
-"""Explicit flight state machine for takeoff, hover, and yaw scan.
-起飛、懸停、偏航掃描的明確飛行狀態機。
+"""Explicit flight state machine for takeoff, hover, yaw scan, and align.
+起飛、懸停、偏航掃描、對齊的明確飛行狀態機。
 
 The supervisor never talks to UDP. It asks a ``TelloController`` to take off,
 to send RC, or to land. That keeps ``DRY_RUN`` in one place and makes the
 transitions unit-testable with a fake controller.
 監督器從不碰 UDP。它只請 ``TelloController`` 起飛、送 RC、或降落。
 這樣 ``DRY_RUN`` 仍集中在一處，狀態轉移也可以用假控制器做單元測試。
+
+Milestone 4 yaws on ``error_x`` until the box is centred left-right, then after
+``TARGET_LOCKED`` uses ``error_y`` to climb or descend. Forward is still later.
+里程碑 4 先用 ``error_x`` 轉到左右置中，進入 ``TARGET_LOCKED`` 後再用 ``error_y`` 升降。
+前進仍留給後面。
 """
 
 from __future__ import annotations
@@ -25,6 +30,7 @@ class FlightState(str, Enum):
     TAKEOFF = "TAKEOFF"
     HOVER_SETTLE = "HOVER_SETTLE"
     SCANNING = "SCANNING"
+    ALIGNING = "ALIGNING"
     TARGET_LOCKED = "TARGET_LOCKED"
     SCAN_TIMEOUT = "SCAN_TIMEOUT"
     BCI_STOP = "BCI_STOP"
@@ -69,6 +75,72 @@ class SupervisorInputs:
     video_ok: bool
     video_on: bool
     battery: Optional[int]
+    error_x: Optional[float] = None
+    error_y: Optional[float] = None
+
+
+def _smoothed_p_command(
+    error: float,
+    smoothed: float,
+    *,
+    kp: float,
+    max_speed: int,
+    min_speed: int,
+    invert: bool = False,
+) -> tuple[int, float]:
+    """Shared P + exponential smoother for one RC axis.
+    單一 RC 軸共用的 P 控制加指數平滑。
+    """
+    if abs(error) <= config.ALIGNMENT_TOLERANCE_PX:
+        # Deadband: command 0 and decay the smoother so we do not kick out.
+        # 死區：指令為 0，並衰減平滑值，避免一出死區就猛轉。
+        return 0, config.YAW_SMOOTHING * smoothed
+
+    direction = -1.0 if invert else 1.0
+    raw = max(-max_speed, min(max_speed, direction * kp * error))
+    alpha = config.YAW_SMOOTHING
+    smoothed = alpha * smoothed + (1.0 - alpha) * raw
+    cmd = int(round(smoothed))
+    cmd = max(-max_speed, min(max_speed, cmd))
+    if abs(cmd) < min_speed:
+        cmd = min_speed if raw > 0 else -min_speed
+        cmd = max(-max_speed, min(max_speed, cmd))
+    return cmd, smoothed
+
+
+def yaw_command_from_error(error_x: float, smoothed: float) -> tuple[int, float]:
+    """P-control yaw from horizontal pixel error, with exponential smoothing.
+    水平像素誤差的 P 控制偏航，加上指數平滑。
+
+    Positive ``error_x`` means the target is to the right of centre, so yaw is
+    clockwise (positive in Tello ``rc``).
+    ``error_x`` 為正代表目標在畫面中心右側，所以偏航順時針（Tello ``rc`` 為正）。
+    """
+    return _smoothed_p_command(
+        error_x,
+        smoothed,
+        kp=config.KP_YAW,
+        max_speed=config.MAX_YAW_SPEED,
+        min_speed=config.ALIGN_MIN_YAW,
+    )
+
+
+def ud_command_from_error(error_y: float, smoothed: float) -> tuple[int, float]:
+    """P-control up/down from vertical pixel error, with exponential smoothing.
+    垂直像素誤差的 P 控制升降，加上指數平滑。
+
+    Positive ``error_y`` means the target is below centre (image y grows down),
+    so the drone descends (negative Tello ``rc`` ud).
+    ``error_y`` 為正代表目標在畫面中心下方（影像 y 向下增加），所以下降（Tello ``rc`` ud 為負）。
+    """
+    return _smoothed_p_command(
+        error_y,
+        smoothed,
+        kp=config.KP_VERTICAL,
+        max_speed=config.MAX_VERTICAL_SPEED,
+        min_speed=config.ALIGN_MIN_UD,
+        invert=True,
+    )
 
 
 class FlightSupervisor:
@@ -80,6 +152,12 @@ class FlightSupervisor:
         self._scan_started_at: Optional[float] = None
         self._airborne_since: Optional[float] = None
         self._hit_streak: int = 0
+        self._miss_streak: int = 0
+        self._align_streak: int = 0
+        self._smoothed_yaw: float = 0.0
+        self._last_align_yaw: int = 0
+        self._smoothed_ud: float = 0.0
+        self._last_align_ud: int = 0
         self._resume_after_hold: Optional[FlightState] = None
 
     @property
@@ -116,8 +194,10 @@ class FlightSupervisor:
             self._step_hover_settle(inputs)
         elif self.state is FlightState.SCANNING:
             self._step_scanning(inputs)
+        elif self.state is FlightState.ALIGNING:
+            self._step_aligning(inputs)
         elif self.state is FlightState.TARGET_LOCKED:
-            self.controller.hover()
+            self._step_target_locked(inputs)
         elif self.state is FlightState.SCAN_TIMEOUT:
             self.controller.hover()
         elif self.state is FlightState.BCI_STOP:
@@ -182,9 +262,9 @@ class FlightSupervisor:
                 self._hit_streak = 0
 
         if self._hit_streak >= config.MIN_DETECTION_FRAMES:
-            LOGGER.info("Target locked after %d consecutive hits", self._hit_streak)
-            self.controller.hover()
-            self._enter(FlightState.TARGET_LOCKED)
+            LOGGER.info("Target seen after %d consecutive hits, aligning", self._hit_streak)
+            self._begin_aligning()
+            self._step_aligning(inputs)
             return
 
         if self._scan_started_at is None:
@@ -198,6 +278,101 @@ class FlightSupervisor:
 
         yaw = min(config.SCAN_YAW_SPEED, config.MAX_YAW_SPEED)
         self.controller.send_rc(0, 0, 0, yaw)
+
+    def _begin_aligning(self) -> None:
+        self._miss_streak = 0
+        self._align_streak = 0
+        self._smoothed_yaw = 0.0
+        self._last_align_yaw = 0
+        self._smoothed_ud = 0.0
+        self._last_align_ud = 0
+        self._enter(FlightState.ALIGNING)
+
+    def _step_aligning(self, inputs: SupervisorInputs) -> None:
+        if inputs.bci_stopped:
+            self._hold(FlightState.BCI_STOP, resume=FlightState.ALIGNING)
+            return
+        if inputs.video_on and not inputs.video_ok:
+            self._hold(FlightState.VIDEO_LOST, resume=FlightState.ALIGNING)
+            return
+
+        if inputs.detection_tick:
+            if not inputs.target_found or inputs.error_x is None:
+                self._miss_streak += 1
+                self._align_streak = 0
+                if self._miss_streak >= config.TARGET_LOST_FRAMES:
+                    LOGGER.info("Target lost while aligning, resume scan")
+                    self._return_to_scan(inputs.now)
+                    self._step_scanning(inputs)
+                    return
+            else:
+                self._miss_streak = 0
+                yaw, self._smoothed_yaw = yaw_command_from_error(inputs.error_x, self._smoothed_yaw)
+                self._last_align_yaw = yaw
+                if abs(inputs.error_x) <= config.ALIGNMENT_TOLERANCE_PX:
+                    self._align_streak += 1
+                else:
+                    self._align_streak = 0
+                if self._align_streak >= config.MIN_DETECTION_FRAMES:
+                    LOGGER.info("Yaw centred, adjusting height")
+                    self._begin_locked()
+                    self._step_target_locked(inputs)
+                    return
+
+        # Keep the last yaw between detection ticks. Never command forward or climb.
+        # 兩次偵測之間維持上一次偏航。絕不送前進或升降。
+        self.controller.send_rc(0, 0, 0, self._last_align_yaw)
+
+    def _begin_locked(self) -> None:
+        self._miss_streak = 0
+        self._smoothed_ud = 0.0
+        self._last_align_ud = 0
+        self._enter(FlightState.TARGET_LOCKED)
+
+    def _step_target_locked(self, inputs: SupervisorInputs) -> None:
+        if inputs.bci_stopped:
+            self._hold(FlightState.BCI_STOP, resume=FlightState.TARGET_LOCKED)
+            return
+        if inputs.video_on and not inputs.video_ok:
+            self._hold(FlightState.VIDEO_LOST, resume=FlightState.TARGET_LOCKED)
+            return
+
+        if inputs.detection_tick:
+            if not inputs.target_found or inputs.error_x is None:
+                self._miss_streak += 1
+                if self._miss_streak >= config.TARGET_LOST_FRAMES:
+                    LOGGER.info("Target lost after lock, resume scan")
+                    self._return_to_scan(inputs.now)
+                    self._step_scanning(inputs)
+                    return
+            else:
+                self._miss_streak = 0
+                if abs(inputs.error_x) > config.ALIGN_REACQUIRE_PX:
+                    LOGGER.info("Target drifted (err x=%.0f), realigning yaw", inputs.error_x)
+                    self._begin_aligning()
+                    self._step_aligning(inputs)
+                    return
+                if inputs.error_y is not None:
+                    ud, self._smoothed_ud = ud_command_from_error(
+                        inputs.error_y, self._smoothed_ud
+                    )
+                    self._last_align_ud = ud
+
+        # Height only after yaw lock. Never command forward.
+        # 偏航鎖定後才調高度。絕不送前進。
+        self.controller.send_rc(0, 0, self._last_align_ud, 0)
+
+    def _return_to_scan(self, now: float) -> None:
+        self._hit_streak = 0
+        self._miss_streak = 0
+        self._align_streak = 0
+        self._smoothed_yaw = 0.0
+        self._last_align_yaw = 0
+        self._smoothed_ud = 0.0
+        self._last_align_ud = 0
+        self._scan_started_at = now
+        self.controller.hover()
+        self._enter(FlightState.SCANNING)
 
     def _step_bci_stop(self, inputs: SupervisorInputs) -> None:
         self.controller.hover()
@@ -248,4 +423,10 @@ class FlightSupervisor:
             self._scan_started_at = None
             self._airborne_since = None
             self._hit_streak = 0
+            self._miss_streak = 0
+            self._align_streak = 0
+            self._smoothed_yaw = 0.0
+            self._last_align_yaw = 0
+            self._smoothed_ud = 0.0
+            self._last_align_ud = 0
             self._resume_after_hold = None

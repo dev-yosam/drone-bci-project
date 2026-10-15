@@ -61,8 +61,11 @@ class Detection:
         目標相對畫面中心的像素偏移。
 
         Positive ``error_x`` means the target sits to the right, which the yaw
-        controller answers with a clockwise rotation.
+        controller answers with a clockwise rotation. Positive ``error_y`` means
+        the target sits below centre (image y grows downward); after yaw lock
+        the height controller descends.
         ``error_x`` 為正代表目標在右邊，偏航控制器會以順時針旋轉回應。
+        ``error_y`` 為正代表目標在畫面中心下方（影像 y 向下增加）；偏航鎖定後高度控制器會下降。
         """
         return (
             self.center_x - frame_width / 2.0,

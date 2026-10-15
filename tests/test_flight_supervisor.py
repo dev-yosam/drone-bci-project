@@ -11,7 +11,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import config  # noqa: E402
-from navigation.flight_supervisor import FlightState, FlightSupervisor, SupervisorInputs  # noqa: E402
+from navigation.flight_supervisor import (  # noqa: E402
+    FlightState,
+    FlightSupervisor,
+    SupervisorInputs,
+    ud_command_from_error,
+    yaw_command_from_error,
+)
 
 
 class FakeDrone:
@@ -61,6 +67,8 @@ def inputs(
     video_ok: bool = True,
     video_on: bool = True,
     battery: int = 80,
+    error_x: float | None = None,
+    error_y: float | None = None,
 ) -> SupervisorInputs:
     return SupervisorInputs(
         now=now,
@@ -70,6 +78,8 @@ def inputs(
         video_ok=video_ok,
         video_on=video_on,
         battery=battery,
+        error_x=error_x,
+        error_y=error_y,
     )
 
 
@@ -116,9 +126,12 @@ class FlightSupervisorTests(unittest.TestCase):
         self.sup.step(inputs(t + 1.0, target_found=True, detection_tick=False))
         self.assertEqual(self.sup.state, FlightState.SCANNING)
 
-        self.sup.step(inputs(t + 1.1, target_found=True, detection_tick=True))
-        self.assertEqual(self.sup.state, FlightState.TARGET_LOCKED)
-        self.assertEqual(self.drone.last_rc, (0, 0, 0, 0))
+        self.sup.step(
+            inputs(t + 1.1, target_found=True, detection_tick=True, error_x=200.0)
+        )
+        self.assertEqual(self.sup.state, FlightState.ALIGNING)
+        self.assertGreater(self.drone.last_rc[3], 0)
+        self.assertEqual(self.drone.last_rc[1], 0)
 
     def test_missed_detection_resets_streak(self):
         t = self._airborne_and_scanning()
@@ -172,6 +185,130 @@ class FlightSupervisorTests(unittest.TestCase):
         self.assertEqual(self.sup.state, FlightState.GROUND)
         self.assertIn("emergency", self.drone.calls)
 
+    def _into_aligning(self, error_x: float = 200.0) -> float:
+        t = self._airborne_and_scanning()
+        for i in range(config.MIN_DETECTION_FRAMES):
+            self.sup.step(
+                inputs(
+                    t + (i + 1) * 0.1,
+                    target_found=True,
+                    detection_tick=True,
+                    error_x=error_x,
+                )
+            )
+        self.assertEqual(self.sup.state, FlightState.ALIGNING)
+        return t + config.MIN_DETECTION_FRAMES * 0.1
+
+    def test_aligning_yaws_clockwise_when_target_is_right(self):
+        self._into_aligning(error_x=200.0)
+        self.assertGreater(self.drone.last_rc[3], 0)
+        self.assertLessEqual(abs(self.drone.last_rc[3]), config.MAX_YAW_SPEED)
+        self.assertEqual(self.drone.last_rc[:3], (0, 0, 0))
+
+    def test_aligning_yaws_counterclockwise_when_target_is_left(self):
+        self._into_aligning(error_x=-200.0)
+        self.assertLess(self.drone.last_rc[3], 0)
+        self.assertEqual(self.drone.last_rc[:3], (0, 0, 0))
+
+    def test_centred_target_locks_after_consecutive_deadband_ticks(self):
+        t = self._into_aligning(error_x=200.0)
+        for i in range(config.MIN_DETECTION_FRAMES):
+            self.sup.step(
+                inputs(
+                    t + (i + 1) * 0.1,
+                    target_found=True,
+                    detection_tick=True,
+                    error_x=0.0,
+                    error_y=0.0,
+                )
+            )
+        self.assertEqual(self.sup.state, FlightState.TARGET_LOCKED)
+        self.assertEqual(self.drone.last_rc, (0, 0, 0, 0))
+
+    def _into_locked(self, error_y: float = 0.0) -> float:
+        t = self._into_aligning(error_x=200.0)
+        for i in range(config.MIN_DETECTION_FRAMES):
+            self.sup.step(
+                inputs(
+                    t + (i + 1) * 0.1,
+                    target_found=True,
+                    detection_tick=True,
+                    error_x=0.0,
+                    error_y=error_y,
+                )
+            )
+        self.assertEqual(self.sup.state, FlightState.TARGET_LOCKED)
+        return t + config.MIN_DETECTION_FRAMES * 0.1
+
+    def test_locked_target_below_centre_descends(self):
+        self._into_locked(error_y=200.0)
+        lr, fb, ud, yaw = self.drone.last_rc
+        self.assertEqual((lr, fb, yaw), (0, 0, 0))
+        self.assertLess(ud, 0)
+        self.assertLessEqual(abs(ud), config.MAX_VERTICAL_SPEED)
+
+    def test_locked_target_above_centre_climbs(self):
+        self._into_locked(error_y=-200.0)
+        lr, fb, ud, yaw = self.drone.last_rc
+        self.assertEqual((lr, fb, yaw), (0, 0, 0))
+        self.assertGreater(ud, 0)
+
+    def test_aligning_does_not_change_height(self):
+        self._into_aligning(error_x=200.0)
+        self.sup.step(
+            inputs(
+                10.0,
+                target_found=True,
+                detection_tick=True,
+                error_x=200.0,
+                error_y=200.0,
+            )
+        )
+        self.assertEqual(self.sup.state, FlightState.ALIGNING)
+        self.assertEqual(self.drone.last_rc[2], 0)
+        self.assertGreater(self.drone.last_rc[3], 0)
+
+    def test_lost_target_while_aligning_returns_to_scan(self):
+        t = self._into_aligning(error_x=200.0)
+        for i in range(config.TARGET_LOST_FRAMES):
+            self.sup.step(
+                inputs(t + (i + 1) * 0.1, target_found=False, detection_tick=True)
+            )
+        self.assertEqual(self.sup.state, FlightState.SCANNING)
+        self.assertGreater(self.drone.last_rc[3], 0)
+
+    def test_drift_after_lock_resumes_aligning(self):
+        t = self._into_aligning(error_x=10.0)
+        for i in range(config.MIN_DETECTION_FRAMES):
+            self.sup.step(
+                inputs(
+                    t + (i + 1) * 0.1,
+                    target_found=True,
+                    detection_tick=True,
+                    error_x=0.0,
+                )
+            )
+        self.assertEqual(self.sup.state, FlightState.TARGET_LOCKED)
+        later = t + 1.0
+        self.sup.step(
+            inputs(
+                later,
+                target_found=True,
+                detection_tick=True,
+                error_x=float(config.ALIGN_REACQUIRE_PX + 40),
+            )
+        )
+        self.assertEqual(self.sup.state, FlightState.ALIGNING)
+        self.assertGreater(self.drone.last_rc[3], 0)
+
+    def test_bci_stop_while_aligning_resumes_aligning(self):
+        t = self._into_aligning(error_x=200.0)
+        self.sup.step(inputs(t + 0.1, bci_stopped=True, target_found=True, error_x=200.0))
+        self.assertEqual(self.sup.state, FlightState.BCI_STOP)
+        self.assertEqual(self.drone.last_rc, (0, 0, 0, 0))
+        self.sup.step(inputs(t + 0.2, bci_stopped=False, target_found=True, error_x=200.0))
+        self.assertEqual(self.sup.state, FlightState.ALIGNING)
+
     def test_takeoff_failure_returns_to_ground(self):
         self.drone.takeoff()
         self.drone.airborne = False
@@ -182,6 +319,58 @@ class FlightSupervisorTests(unittest.TestCase):
         self.sup.step(inputs(0.0))
         self.assertEqual(self.sup.state, FlightState.GROUND)
         self.assertEqual(self.sup.safety_trigger, "takeoff_failed")
+
+
+class YawCommandTests(unittest.TestCase):
+    def test_deadband_commands_zero(self):
+        cmd, _ = yaw_command_from_error(0.0, 0.0)
+        self.assertEqual(cmd, 0)
+        cmd, _ = yaw_command_from_error(float(config.ALIGNMENT_TOLERANCE_PX), 0.0)
+        self.assertEqual(cmd, 0)
+
+    def test_positive_error_is_clockwise(self):
+        cmd, smoothed = yaw_command_from_error(200.0, 0.0)
+        self.assertGreater(cmd, 0)
+        self.assertLessEqual(cmd, config.MAX_YAW_SPEED)
+        self.assertGreater(smoothed, 0)
+
+    def test_negative_error_is_counterclockwise(self):
+        cmd, _ = yaw_command_from_error(-200.0, 0.0)
+        self.assertLess(cmd, 0)
+        self.assertGreaterEqual(cmd, -config.MAX_YAW_SPEED)
+
+    def test_clamped_to_max_yaw(self):
+        cmd, _ = yaw_command_from_error(10_000.0, 0.0)
+        self.assertLessEqual(abs(cmd), config.MAX_YAW_SPEED)
+
+    def test_smoothing_lags_the_raw_command(self):
+        first, smoothed = yaw_command_from_error(200.0, 0.0)
+        second, _ = yaw_command_from_error(200.0, smoothed)
+        raw = min(config.MAX_YAW_SPEED, config.KP_YAW * 200.0)
+        self.assertLess(abs(first), abs(raw) + 1e-6)
+        self.assertGreaterEqual(abs(second), abs(first))
+
+
+class UdCommandTests(unittest.TestCase):
+    def test_deadband_commands_zero(self):
+        cmd, _ = ud_command_from_error(0.0, 0.0)
+        self.assertEqual(cmd, 0)
+        cmd, _ = ud_command_from_error(float(config.ALIGNMENT_TOLERANCE_PX), 0.0)
+        self.assertEqual(cmd, 0)
+
+    def test_positive_error_descends(self):
+        cmd, _ = ud_command_from_error(200.0, 0.0)
+        self.assertLess(cmd, 0)
+        self.assertGreaterEqual(cmd, -config.MAX_VERTICAL_SPEED)
+
+    def test_negative_error_climbs(self):
+        cmd, _ = ud_command_from_error(-200.0, 0.0)
+        self.assertGreater(cmd, 0)
+        self.assertLessEqual(cmd, config.MAX_VERTICAL_SPEED)
+
+    def test_clamped_to_max_vertical(self):
+        cmd, _ = ud_command_from_error(10_000.0, 0.0)
+        self.assertLessEqual(abs(cmd), config.MAX_VERTICAL_SPEED)
 
 
 if __name__ == "__main__":

@@ -140,8 +140,36 @@ class TelloController:
         # 建立 Tello 物件時就會 bind UDP 8889，並啟動接收執行緒。
         self.tello = Tello(host=self.host, retry_count=config.CONNECT_RETRY_COUNT)
         self.tello.connect()
+        self._prime_battery()
 
         LOGGER.info("Connected. Battery %s%%, SDK %s", self.battery, self.sdk_version)
+        sdk = self.sdk_version
+        if self.battery is None or sdk in (None, "", "0", 0):
+            LOGGER.warning(
+                "Telemetry looks empty (battery=%s, SDK=%s). "
+                "If video also fails, power-cycle the Tello before flying.",
+                self.battery,
+                sdk,
+            )
+
+    def _prime_battery(self) -> None:
+        """Read battery over the command channel right after connect.
+        連線後立刻用指令通道讀電量。
+
+        ``get_battery()`` reads the 8890 state stream, which often starts at
+        ``bat:0`` for a few packets. That is not an empty pack; a fake 0 would
+        also refuse takeoff (threshold 40%). ``battery?`` is the real value.
+        ``get_battery()`` 讀的是 8890 狀態串流，剛連上常連續幾包都是 ``bat:0``。
+        那不是電池沒電；假的 0 還會讓起飛被拒（門檻 40%）。``battery?`` 才是真值。
+        """
+        if self.tello is None:
+            return
+        try:
+            percent = int(self.tello.query_battery())
+        except (TelloException, OSError, ValueError, TypeError) as error:
+            LOGGER.warning("battery? query failed: %s", error)
+            return
+        self._telemetry_cache["battery"] = (time.time(), percent)
 
     # -- video --------------------------------------------------------------
     # -- 影像 ---------------------------------------------------------------
@@ -274,6 +302,14 @@ class TelloController:
             LOGGER.debug("Telemetry %s unavailable: %s", key, error)
             return cached[1] if cached is not None else default
 
+        # The state stream often reports bat:0 before the first real packet.
+        # Keep the last non-zero reading (usually from battery?) instead.
+        # 狀態串流在第一包真值前常報 bat:0。改留著上一次非 0（通常來自 battery?）。
+        if key == "battery" and value == 0:
+            if cached is not None and cached[1] not in (None, 0):
+                return cached[1]
+            return default
+
         self._telemetry_cache[key] = (now, value)
         return value
 
@@ -346,6 +382,11 @@ class TelloController:
                 battery,
                 config.MIN_BATTERY_TAKEOFF,
             )
+            return False
+        # LIVE needs a camera. Video-off is only for DRY_RUN / --no-video telemetry.
+        # LIVE 一定要有鏡頭。關掉影像只適用 DRY_RUN 或 --no-video 遙測。
+        if not self.dry_run and not self.video_ok:
+            LOGGER.error("Refusing takeoff: no camera frames. LIVE flight needs video.")
             return False
         return self._start_blocking("takeoff", self._takeoff_body, sets_airborne=True)
 
